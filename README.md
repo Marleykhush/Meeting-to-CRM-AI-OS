@@ -13,7 +13,7 @@ Every execution is logged to Google Sheets regardless of outcome.
 
 ## Setup
 
-Import `Meeting-to-CRM.json` into n8n. You'll need your own credentials for:
+Import `Meeting-to-CRM System.json` into n8n. You'll need your own credentials for:
 - Telegram Bot (audio intake + notifications)
 - A transcription service (Whisper-based)
 - Google Gemini (extraction)
