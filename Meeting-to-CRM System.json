@@ -1,0 +1,860 @@
+{
+  "name": "Meeting-to-CRM System",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "channel_post"
+        ],
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.5,
+      "position": [
+        -272,
+        -16
+      ],
+      "id": "27aee162-01e9-45d2-a826-d4c1fdef1bcd",
+      "name": "Receives audio message",
+      "webhookId": "c3b8d2e7-c5cf-4779-85c3-75a8dd621a30",
+      "credentials": {
+        "telegramApi": {
+          "id": "MCrGaInacpNW8V7u",
+          "name": "Telegram account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "fileId": "={{ $json.channel_post.voice.file_id }}",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        176,
+        -112
+      ],
+      "id": "126842a3-46e8-4deb-b84a-63419e0063ca",
+      "name": "Gets audio file",
+      "webhookId": "2adfaa0b-83de-4368-9cb6-f75909d8f8f8",
+      "credentials": {
+        "telegramApi": {
+          "id": "MCrGaInacpNW8V7u",
+          "name": "Telegram account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ==========================================\n// 1. GET DATA\n// ==========================================\n\nconst transcript = $('Transcribe Audio').first().json.text?.trim() || \"\";\nconst rawOutput = $json.output;\n\n\n// ==========================================\n// 2. PARSE LLM JSON\n// ==========================================\n\nlet data;\n\ntry {\n  data = JSON.parse(rawOutput);\n} catch (error) {\n  return {\n    json: {\n      validation_status: \"FAILED\",\n      review_required: true,\n      errors: [\"LLM output is not valid JSON.\"],\n      warnings: [],\n      transcript,\n      raw_output: rawOutput\n    }\n  };\n}\n\n\nfunction evidenceOverlapScore(evidenceText, transcriptLower) {\n  const cleaned = evidenceText\n    .replace(/^transcript:\\s*/i, \"\")   // strip \"Transcript:\" prefix\n    .replace(/['\"]/g, \"\");             // strip quote marks\n\n  const words = cleaned.toLowerCase().split(/\\s+/)\n    .map(w => w.replace(/[^\\w]/g, \"\")) // strip trailing punctuation per word\n    .filter(w => w.length > 2);\n\n  if (words.length === 0) return 1;\n  const found = words.filter(w => transcriptLower.includes(w));\n  return found.length / words.length;\n}\n\n// ==========================================\n// 2.5. EMAIL NORMALIZATION HELPER\n// ==========================================\n// Fixes transcription artifacts where a spoken \"at\" symbol\n// gets dropped (e.g. \"name.gmail.com\" instead of \"name@gmail.com\")\n\nconst EMAIL_PATTERN = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$/;\n\nfunction normalizeEmail(email) {\n  if (!email) return email;\n  if (EMAIL_PATTERN.test(email)) return email;\n\n  const knownDomains = [\"gmail.com\", \"yahoo.com\", \"outlook.com\", \"hotmail.com\", \"icloud.com\"];\n  for (const domain of knownDomains) {\n    if (email.toLowerCase().endsWith(\".\" + domain)) {\n      const local = email.slice(0, -(domain.length + 1));\n      return local + \"@\" + domain;\n    }\n  }\n\n  return email; // could not auto-fix; regex check below will correctly flag it\n}\n\nfunction evidenceOverlapScore(evidenceText, transcriptLower) {\n  const cleaned = evidenceText\n    .replace(/^transcript:\\s*/i, \"\")\n    .replace(/['\"]/g, \"\");\n\n  const words = cleaned.toLowerCase().split(/\\s+/)\n    .map(w => w.replace(/^[^\\w]+|[^\\w]+$/g, \"\")) // only trim edges, keep internal punctuation\n    .filter(w => w.length > 2);\n\n  if (words.length === 0) return 1;\n  const found = words.filter(w => transcriptLower.includes(w));\n  return found.length / words.length;\n}\n// ==========================================\n// 3. EXTRACT SECTIONS\n// ==========================================\n\nconst client = data.CLIENT || {};\n\nif (client.Email) {\n  client.Email = normalizeEmail(client.Email);\n}\n\nconst property = data.PROPERTY_VIEWING || {};\nconst deal = data.DEAL || {};\nconst actions = data.ACTIONS || [];\nconst followUp = data.FOLLOW_UP || {};\nconst uncertainty = data.UNCERTAINTY || {};\nconst evidence = data.EVIDENCE || {};\n\n\n// ==========================================\n// 4. VALIDATION ARRAYS\n// ==========================================\n\nconst errors = [];\nconst warnings = [];\n\n\n// ==========================================\n// 5. BASIC TRANSCRIPT VALIDATION\n// ==========================================\n\nif (!transcript) {\n  errors.push(\"Original transcript is missing.\");\n}\n\n\n// ==========================================\n\n// ==========================================\n// ==========================================\n// 5.5. CHECK FOR NON-ACTIONABLE TRANSCRIPT\n// ==========================================\n\nconst reviewItems = uncertainty[\"Information that requires human review\"];\nconst reviewItemsArray = Array.isArray(reviewItems)\n  ? reviewItems\n  : (typeof reviewItems === \"string\" ? [reviewItems] : []);\n\nconst noActionableData = reviewItemsArray.some(\n  item => /no actionable|unrelated|not.*real estate|social chatter|irrelevant|small talk/i.test(item)\n);\n\nfunction isEmptyField(val) {\n  return !val || val === \"unknown\" || (Array.isArray(val) && val.length === 0);\n}\n\nconst allClientFieldsEmpty = isEmptyField(client.Name) && isEmptyField(client.Email) &&\n  isEmptyField(client.Budget) && isEmptyField(client[\"Preferred locations\"]);\n\nif (noActionableData || allClientFieldsEmpty) {\n  errors.push(\"Transcript contains no actionable real estate/CRM data.\");\n}\n\n\n// 6. CHECK EVIDENCE AGAINST TRANSCRIPT\n// ==========================================\n\nconst transcriptLower = transcript.toLowerCase();\n\nfor (const [field, evidenceText] of Object.entries(evidence)) {\n  if (!evidenceText || typeof evidenceText !== \"string\") continue;\n\n  const score = evidenceOverlapScore(evidenceText, transcriptLower);\n  if (score < 0.6) {\n    warnings.push(`Evidence mismatch: \"${field}\" evidence has low overlap with the original transcript.`);\n  }\n}\n\n// ==========================================\n// 7. CHECK CLIENT INFORMATION\n// ==========================================\n\n// Budget\nif (client.Budget) {\n  const budget = String(client.Budget);\n  const budgetPattern = /(\\d+)\\s*(?:to|-)\\s*(\\d+)\\s*(million|m)/i;\n\n  if (!budgetPattern.test(budget)) {\n    warnings.push(\"Client budget could not be confidently validated.\");\n  }\n}\n\n// Preferred locations\nif (client[\"Preferred locations\"] && !Array.isArray(client[\"Preferred locations\"])) {\n  errors.push(\"Preferred locations must be an array.\");\n}\n\n// Property types\nif (client[\"Property types\"] && !Array.isArray(client[\"Property types\"])) {\n  errors.push(\"Property types must be an array.\");\n}\n\n// Email presence + format (runs after normalization above)\nif (!client.Email) {\n  warnings.push(\"Client email is missing — required for HubSpot sync.\");\n} else if (!EMAIL_PATTERN.test(client.Email)) {\n  warnings.push(`Client email \"${client.Email}\" appears malformed (missing @ or domain).`);\n}\n\n\n// ==========================================\n// 8. CHECK PROPERTY INFORMATION\n// ==========================================\n\nif (property[\"Property name or ID\"] && !evidence[\"Property name or ID\"]) {\n  warnings.push(\"Property name/ID was extracted but no supporting evidence was provided.\");\n}\n\n\n// ==========================================\n// 9. CHECK ACTIONS\n// ==========================================\n\nif (!Array.isArray(actions)) {\n  errors.push(\"Actions must be returned as an array.\");\n} else {\n  actions.forEach((action, index) => {\n    if (!action.Action) {\n      errors.push(`Action ${index + 1} is missing an action description.`);\n    }\n\n    if (!action[\"Action owner\"]) {\n      warnings.push(`Action ${index + 1} has no owner.`);\n    }\n  });\n}\n\n\n// ==========================================\n// 10. FOLLOW-UP VALIDATION\n// ==========================================\n\nconst followUpRequired = followUp[\"Follow-up required\"];\nconst followUpDate = followUp[\"Follow-up date/timeframe\"];\n\nif (followUpRequired === true && !followUpDate) {\n  errors.push(\"Follow-up is required but no follow-up date/timeframe was provided.\");\n}\n\nif (typeof followUpDate === \"string\" && /\\b(or|and)\\b/i.test(followUpDate)) {\n  warnings.push(`Follow-up date appears ambiguous: \"${followUpDate}\".`);\n}\n\n\n// ==========================================\n// 11. RESPECT AI-IDENTIFIED UNCERTAINTY\n// ==========================================\n// Filter out stale email-related uncertainty items if the email\n// has already been normalized/validated successfully above.\n\nconst emailIsValid = !!(client.Email && EMAIL_PATTERN.test(client.Email));\n\nfunction filterStaleEmailItems(items) {\n  if (!Array.isArray(items)) return [];\n  return items.filter(item => !(emailIsValid && /email/i.test(item)));\n}\n\nif (uncertainty[\"Ambiguous information\"]) {\n  warnings.push(\n    ...filterStaleEmailItems(uncertainty[\"Ambiguous information\"])\n      .map(item => `AI identified ambiguity: ${item}`)\n  );\n}\n\nif (uncertainty[\"Conflicting information\"]) {\n  warnings.push(\n    ...filterStaleEmailItems(uncertainty[\"Conflicting information\"])\n      .map(item => `AI identified conflict: ${item}`)\n  );\n}\n\nif (uncertainty[\"Information that requires human review\"]) {\n  warnings.push(\n    ...filterStaleEmailItems(uncertainty[\"Information that requires human review\"])\n      .map(item => `AI requested human review: ${item}`)\n  );\n}\n\n\n// ==========================================\n// 12. CHECK FOR MISSING CLIENT NAME\n// ==========================================\n\nif (!client.Name) {\n  warnings.push(\"Client name is missing.\");\n}\n\n\n// ==========================================\n// 13. DETERMINE FINAL STATUS\n// ==========================================\n\nlet validationStatus;\n\nif (errors.length > 0) {\n  validationStatus = \"FAILED\";\n} else if (warnings.length > 0) {\n  validationStatus = \"REVIEW\";\n} else {\n  validationStatus = \"PASSED\";\n}\n\nconst reviewRequired = validationStatus !== \"PASSED\";\n\n\n// ==========================================\n// 14. RETURN CLEAN OUTPUT\n// ==========================================\n\nreturn {\n  json: {\n    validation_status: validationStatus,\n    review_required: reviewRequired,\n    errors,\n    warnings,\n    transcript,\n    client,\n    property,\n    deal,\n    actions,\n    follow_up: followUp,\n    uncertainty,\n    evidence\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        976,
+        -112
+      ],
+      "id": "3824347b-a0f8-4037-94dc-68ce415a825f",
+      "name": "LLM Output"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "53f14318-0f40-4cae-97ed-30161e1c341a",
+              "leftValue": "={{ $json.channel_post.audio || $json.channel_post.voice }}",
+              "rightValue": "=$json.message.audio",
+              "operator": {
+                "type": "object",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -48,
+        -16
+      ],
+      "id": "3819b730-2e46-4f75-815f-a004f76b078e",
+      "name": "Audio pathway"
+    },
+    {
+      "parameters": {
+        "resource": "audio",
+        "operation": "transcribe",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        400,
+        -112
+      ],
+      "id": "10bde64b-d4ca-47af-9808-c0dd88dd4b86",
+      "name": "Transcribe Audio",
+      "credentials": {
+        "openAiApi": {
+          "id": null,
+          "name": "",
+          "__aiGatewayManaged": true
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        176,
+        80
+      ],
+      "id": "da207d97-d620-4879-a066-45ec2a87a8bc",
+      "name": "No Operation, do nothing"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        704,
+        112
+      ],
+      "id": "872e7c82-19fb-4f72-b5aa-12b84b601a04",
+      "name": "Google Gemini Chat Model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "nim6pJQ10xJU4aJq",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are the intelligence layer of a Real Estate Meeting-to-CRM Operations System.\n\nYour job is to convert a property-viewing conversation into reliable, CRM-ready information.\n\nTRANSCRIPT:\n{{ $json.text }}\n\nAUDIO DURATION:\n{{ $json.usage.seconds }} seconds\n\n\n## WHAT TO EXTRACT\n\nExtract information in these categories:\n\n1. CLIENT\n- Name\n- Email\n- Budget\n- Preferred locations\n- Property types\n- Requirements/preferences\n- Purchase timeline\n- Financing information\n- People involved in the decision\n\n2. PROPERTY VIEWING\n- Property name or ID\n- Interest level\n- Positive feedback\n- Objections\n- Concerns\n- Reaction to price\n\n3. DEAL\n- Purchase intent\n- Buying readiness\n- Reason for purchase\n- Alternatives/other properties mentioned\n- Buying signals\n- Blockers\n\n4. ACTIONS\n- Actions explicitly agreed or stated\n- Action owner\n- Due date or timeframe, if explicitly stated\n\n5. FOLLOW-UP\n- Whether follow-up is required\n- Follow-up date/timeframe, if explicitly stated\n- Reason for follow-up\n- Follow-up message draft\n\n6. UNCERTAINTY\n- Missing information\n- Ambiguous information\n- Conflicting information\n- Information that requires human review\n\n7. EVIDENCE\nFor important extracted facts, provide brief evidence from the transcript showing where the information came from.\n\n\n## STRICT GROUNDING RULES\n\n1. Extract only information supported by the transcript.\n\n2. NEVER invent, assume, or fill in missing information.\n\n3. If information is not stated, return null, an empty array, or \"unknown\" according to the schema.\n\n4. Preserve the exact specificity of the speaker's statement.\n   Example:\n   \"I'm considering places in Ajah\" → [\"Ajah\"]\n   Do NOT change this to [\"Nigeria\"].\n\n5. Do not broaden, generalize, or reinterpret locations.\n   Only return a location explicitly mentioned by the speaker.\n\n6. Do not infer a budget from the price of a property.\n\n7. Do not infer purchase intent from politeness, general interest, or positive feedback.\n\n8. Do not treat a person as a decision maker unless the conversation provides evidence that they are involved in the decision.\n\n9. Do not create actions, commitments, dates, or deadlines that were not explicitly stated.\n\n10. If the transcript says \"Friday\", return Friday.\n    Do not add Sunday, Saturday, or another date unless it is explicitly mentioned.\n\n11. If no property name or property ID is provided, return null.\n    Do not create labels such as \"current listing\" or \"property viewed.\"\n\n12. Distinguish between statements made by the client and statements made by the agent.\n\n13. Do not convert possibilities into facts.\n    Example:\n    \"I might consider Ajah\" → Ajah is a location being considered, not a confirmed preference.\n\n14. If two statements conflict, do not choose one.\n    Record the conflict and flag it for review.\n\n15. Evidence must support the extracted value. Do not create evidence that is not present in the transcript.\n\n16. Confidence must reflect the strength of the evidence in the transcript.\n\n\n## IMPORTANT DISTINCTION\n\nYour task is EXTRACTION, not decision-making.\n\nDo NOT:\n- Negotiate with the client\n- Recommend properties\n- Determine whether the client will buy\n- Create sales strategies\n- Invent missing CRM information\n- Make assumptions about what the client \"probably\" means\n\nOnly extract what the conversation supports.\n\n\n## OUTPUT\n\nReturn ONLY the structured output defined by the provided schema.\n\nDo not return explanations, markdown, commentary, or additional fields.\n\nThe output will be validated by a downstream system before any CRM updates or external actions are executed.",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        624,
+        -112
+      ],
+      "id": "45e09df8-7bb7-42bb-b507-bade828fa05f",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "1e2e9869-e814-4e13-b834-58f8d3a4807a",
+                    "leftValue": "={{ $json.validation_status }}",
+                    "rightValue": "PASSED",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Passed"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.validation_status }}",
+                    "rightValue": "REVIEW",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "32eca234-1e51-4a1c-9b5a-7792107337e9"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Review"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "300a2524-3f99-44e9-8c5e-df369fcc240f",
+                    "leftValue": "={{ $json.validation_status }}",
+                    "rightValue": "FAILED",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Error"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        1200,
+        -336
+      ],
+      "id": "44222ab1-12ce-4947-a115-db73092b02e4",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $json;\n\nreturn {\n  json: {\n    status: \"FAILED\",\n    error_type: \"validation_failure\",\n\n    message: \"The property-viewing data failed validation and was not sent for CRM execution.\",\n\n    errors: data.errors || [],\n    warnings: data.warnings || [],\n\n    review_required: true,\n    requires_manual_intervention: true,\n\n    transcript: data.transcript || null,\n\n    client: data.client || null,\n    property: data.property || null,\n    deal: data.deal || null,\n\n    timestamp: new Date().toISOString()\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1424,
+        -32
+      ],
+      "id": "f0af3eec-e2eb-4d9e-bd2e-75af5dfa4682",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "authentication": "appToken",
+        "email": "={{ $json.client.Email }}",
+        "additionalFields": {},
+        "options": {}
+      },
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 2.2,
+      "position": [
+        2320,
+        -416
+      ],
+      "id": "406eae01-d2de-4bfd-96ce-01470b60977e",
+      "name": "Create or update a contact",
+      "credentials": {
+        "hubspotAppToken": {
+          "id": "tsZ8ganDe8b8Ih4w",
+          "name": "HubSpot Service Key account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Receives audio message').first().json.channel_post.chat.id }}",
+        "text": "={{ 'Review needed. Client: ' + ($json.client.Name || 'Unknown') + '. Warnings: ' + $json.warnings.join(', ') }}\\n\\nFill this in: {{ $execution.resumeUrl }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1424,
+        -224
+      ],
+      "id": "a7658414-395f-46b7-975c-f0319a15f97a",
+      "name": "Send Review Message",
+      "webhookId": "be66e620-cbe6-45e1-a1c9-dbad7fcec6b2",
+      "credentials": {
+        "telegramApi": {
+          "id": "MCrGaInacpNW8V7u",
+          "name": "Telegram account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resume": "form",
+        "formTitle": "Review",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Email"
+            },
+            {
+              "fieldLabel": "Name"
+            },
+            {
+              "fieldLabel": "Budget"
+            },
+            {
+              "fieldLabel": "Property Name"
+            },
+            {
+              "fieldLabel": "Follow up"
+            },
+            {
+              "fieldLabel": "Action Owner"
+            }
+          ]
+        },
+        "options": {
+          "respondWithOptions": {
+            "values": {}
+          }
+        }
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1648,
+        -224
+      ],
+      "id": "bdae3b80-a05b-4696-b00b-6ea823a2a44c",
+      "name": "Wait",
+      "webhookId": "a130fa7c-521e-46f5-8ec8-3fb223900e82"
+    },
+    {
+      "parameters": {
+        "jsCode": "const original = $('LLM Output').first().json;\nconst formResponse = $json;\n\nconst mergedClient = {\n  ...original.client,\n  Name: formResponse.Name || original.client?.Name,\n  Email: formResponse.Email || original.client?.Email,\n  Budget: formResponse.Budget || original.client?.Budget,\n};\n\nconst mergedProperty = {\n  ...original.property,\n  \"Property name or ID\": formResponse[\"Property Name or ID\"] || original.property?.[\"Property name or ID\"],\n};\n\nconst mergedFollowUp = {\n  ...original.follow_up,\n  \"Follow-up date/timeframe\": formResponse[\"Follow-up Date\"] || original.follow_up?.[\"Follow-up date/timeframe\"],\n};\n\nreturn {\n  json: {\n    client: mergedClient,\n    property: mergedProperty,\n    deal: original.deal,\n    follow_up: mergedFollowUp,\n    actions: original.actions,\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1872,
+        -224
+      ],
+      "id": "c26f30f8-d14a-459e-ba45-633697703e4a",
+      "name": "Merge with Existing Form Response"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2096,
+        -464
+      ],
+      "id": "0c68349d-5b5e-4e3d-9dda-bc8343ae9ff7",
+      "name": "No Operation, do nothing2"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Receives audio message').first().json.channel_post.chat.id }}",
+        "text": "={{ '❌ Failed: ' + $json.message + '. Client: ' + ($json.client?.Name || 'Unknown') + '. Errors: ' + $json.errors.join(', ') }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1648,
+        -32
+      ],
+      "id": "f1e3016c-b693-42ac-90af-a0c321b29013",
+      "name": "Send Review Message1",
+      "webhookId": "be66e620-cbe6-45e1-a1c9-dbad7fcec6b2",
+      "credentials": {
+        "telegramApi": {
+          "id": "MCrGaInacpNW8V7u",
+          "name": "Telegram account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "appToken",
+        "resource": "deal",
+        "stage": "={{ $('Create or update a contact').item.json.id }}",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 2.2,
+      "position": [
+        2544,
+        -416
+      ],
+      "id": "ebc5aef0-98b7-48ae-9cc0-0c22e04d6c21",
+      "name": "Create a deal",
+      "credentials": {
+        "hubspotAppToken": {
+          "id": "tsZ8ganDe8b8Ih4w",
+          "name": "HubSpot Service Key account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1PeioU3mFrTwMRwrUITif02VrKkjUYSkCd5FLHuup5R8",
+          "mode": "list",
+          "cachedResultName": "Meeting-CRM Log",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1PeioU3mFrTwMRwrUITif02VrKkjUYSkCd5FLHuup5R8/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Activity Log",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1PeioU3mFrTwMRwrUITif02VrKkjUYSkCd5FLHuup5R8/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Timestamp": "={{ $now }}",
+            "Status": "={{ $json.validation_status }}",
+            "Client Name": "={{ $json.client.Name }}",
+            "Client Email": "={{ $json.client.Email }}",
+            "Errors": "={{ $json.errors.join('; ') }}",
+            "Warnings": "={{ $json.warnings.join('; ') }}",
+            "Review Required": "={{ $json.review_required }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Timestamp",
+              "displayName": "Timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Status",
+              "displayName": "Status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Client Name",
+              "displayName": "Client Name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Client Email",
+              "displayName": "Client Email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Errors",
+              "displayName": "Errors",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Warnings",
+              "displayName": "Warnings",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Review Required",
+              "displayName": "Review Required",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1200,
+        -112
+      ],
+      "id": "499865ad-4544-4136-bf32-9d8917d9bdda",
+      "name": "Append row in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "XbEJkdQ7Q4uM6nEQ",
+          "name": "Google Sheets account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "4e5382c3-57c2-44c9-90a6-6042bcd99831",
+              "leftValue": "={{\n  !!$json.client?.Email &&\n  /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$/.test($json.client.Email)\n}}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2096,
+        -224
+      ],
+      "id": "98669ebf-6acd-45be-b154-e13a0160da31",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Receives audio message').first().json.channel_post.chat.id }}",
+        "text": "={{ '⚠️ Still missing required info for ' + ($json.client?.Name || 'this client') + '. The review form was submitted without an email, so this record couldn\\'t sync to HubSpot automatically. Please add it manually in HubSpot, or reply here with the correct email and I\\'ll pass it along.' }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2320,
+        -176
+      ],
+      "id": "59b5863d-2120-4291-92dc-076f29d968de",
+      "name": "Send Review Message2",
+      "webhookId": "be66e620-cbe6-45e1-a1c9-dbad7fcec6b2",
+      "credentials": {
+        "telegramApi": {
+          "id": "MCrGaInacpNW8V7u",
+          "name": "Telegram account 3"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1872,
+        -464
+      ],
+      "id": "70db36f0-ffd4-4626-9dc4-f147aa3e504e",
+      "name": "No Operation, do nothing1"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1648,
+        -464
+      ],
+      "id": "9818fcfc-e26d-4f82-b039-bb017ce24455",
+      "name": "No Operation, do nothing3"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Receives audio message": {
+      "main": [
+        [
+          {
+            "node": "Audio pathway",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gets audio file": {
+      "main": [
+        [
+          {
+            "node": "Transcribe Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM Output": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Append row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audio pathway": {
+      "main": [
+        [
+          {
+            "node": "Gets audio file",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Operation, do nothing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transcribe Audio": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "LLM Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "No Operation, do nothing3",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Review Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Send Review Message1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Review Message": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Merge with Existing Form Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create or update a contact": {
+      "main": [
+        [
+          {
+            "node": "Create a deal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge with Existing Form Response": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "No Operation, do nothing2": {
+      "main": [
+        [
+          {
+            "node": "Create or update a contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append row in sheet": {
+      "main": [
+        []
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Create or update a contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Review Message2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "No Operation, do nothing1": {
+      "main": [
+        [
+          {
+            "node": "No Operation, do nothing2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "No Operation, do nothing3": {
+      "main": [
+        [
+          {
+            "node": "No Operation, do nothing1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "1468c498-aa18-4a2b-99b7-bb4f89bb3716",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "391fdfd990535e638c3c802eed0591c49416e5291f6d25c71d937e423f5c2743"
+  },
+  "nodeGroups": [],
+  "id": "baloBhwQGWksN28V",
+  "tags": []
+}
