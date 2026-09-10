@@ -26,6 +26,10 @@ No secrets are included in the export — only credential references.
 
 See `/samples` for example audio/transcripts covering a clean pass, a missing-field case, and a rejected case.
 
+## Loom
+
+See `/Loom` for a video demonstrating the Mini OS in action.
+
 ## Docs
 
 Full case study, evaluation results, and failure analysis are in the accompanying submission documents (Case Study, Evaluation Package, AI Collaboration Note).
